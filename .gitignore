@@ -1,0 +1,6 @@
+# Build artifacts
+Samsung Scanner.app/Contents/MacOS/
+Samsung Scanner.app/Contents/_CodeSignature/
+
+# macOS noise
+.DS_Store
