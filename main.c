@@ -37,6 +37,16 @@
 #include <CoreGraphics/CoreGraphics.h>
 
 #include <ICADevices/ICADevices.h>
+#include <os/log.h>
+
+// diagnostics:  log stream --info --predicate 'subsystem == "pl.m2070.scanner"'
+static os_log_t DrvLog(void)
+{
+    static os_log_t l;
+    if (!l) l = os_log_create("pl.m2070.scanner", "driver");
+    return l;
+}
+#define LOG(fmt, ...) os_log(DrvLog(), fmt, ##__VA_ARGS__)
 
 // ---------------------------------------------------------------------------
 // constants that are not (or no longer) exported in the modern SDK headers
@@ -357,6 +367,7 @@ static ICAError OpenTCPIPDevice(CFDictionaryRef params, ScannerObjectInfo* objec
     if (!st) return kICADeviceMemoryAllocationErr;
     StateFromUserInfo(st, params);
     SetDeviceObjectName(objectInfo, st);
+    LOG("OpenTCPIPDevice name=%{public}s dev=%{public}s", st->name, st->sanedev);
     return noErr;
 }
 
@@ -394,6 +405,8 @@ static ICAError OpenUSBCommon(UInt32 locationID, const char* ioregPath,
     if (service) IOObjectRelease(service);
     snprintf(st->sanedev, sizeof st->sanedev, "xerox_mfp:libusb 0x%08x", (unsigned)locationID);
     SetDeviceObjectName(objectInfo, st);
+    LOG("OpenUSBDevice loc=0x%08x path=%{public}s name=%{public}s",
+        (unsigned)locationID, st->usbIORegPath, st->name);
     return noErr;
 }
 
@@ -552,6 +565,7 @@ static ICAError AddPropertiesToCFDictionary(ScannerObjectInfo* objectInfo,
 static ICAError OpenSession(const ScannerObjectInfo* deviceObjectInfo,
                             ICD_ScannerOpenSessionPB* pb)
 {
+    LOG("OpenSession");
     
     (void)deviceObjectInfo;
     return noErr;
@@ -560,6 +574,7 @@ static ICAError OpenSession(const ScannerObjectInfo* deviceObjectInfo,
 static ICAError CloseSession(const ScannerObjectInfo* deviceObjectInfo,
                              ICD_ScannerCloseSessionPB* pb)
 {
+    LOG("CloseSession");
     
     (void)deviceObjectInfo;
     return noErr;
@@ -576,6 +591,7 @@ static ICAError Initialize(const ScannerObjectInfo* deviceObjectInfo,
 static ICAError GetParameters(const ScannerObjectInfo* deviceObjectInfo,
                               ICD_ScannerGetParametersPB* pb)
 {
+    LOG("GetParameters");
 
     if (pb->theDict == NULL) {
         pb->theDict = CreateMutableDict();
@@ -602,7 +618,7 @@ static ICAError SetParameters(const ScannerObjectInfo* deviceObjectInfo,
         a = CFDictionaryGetValue(pb->theDict, deviceKey);
         if (a && CFGetTypeID(a) == CFDictionaryGetTypeID()) d = (CFDictionaryRef)a;
     }
-    if (!d) { (void)deviceObjectInfo; return noErr; }
+    if (!d) { LOG("SetParameters: no userScanArea/device dict"); (void)deviceObjectInfo; return noErr; }
 
     static const CFStringRef kScanModeKey = CFSTR("scan mode");
     static const CFStringRef kOffsetXKey = CFSTR("offsetX");
@@ -674,6 +690,9 @@ static ICAError SetParameters(const ScannerObjectInfo* deviceObjectInfo,
         CFStringGetCString((CFStringRef)de, st.docExt, sizeof st.docExt, kCFStringEncodingUTF8);
 
     memcpy(&gSettings, &st, sizeof gSettings);
+    LOG("SetParameters res=%ld type=%ld depth=%ld off=%.0fx%.0f size=%.0fx%.0f overview=%d ext=%{public}s",
+        st.resolution, st.pixelType, st.bitDepth, st.offsetX, st.offsetY, st.width, st.height,
+        st.isOverview, st.docExt);
     
     (void)deviceObjectInfo;
     return noErr;
@@ -1230,7 +1249,11 @@ static ICAError ScanRaw(const ScanSettings* s,
 
     ScanConn conn;
     ScanConn* c = &conn;
-    if (conn_open(s, c) != 0) return kICADeviceNotOpenErr;
+    if (conn_open(s, c) != 0) {
+        LOG("ScanRaw: cannot open %{public}s (usb=%d)", s->isUSB ? "USB device" : s->sanedev, s->isUSB);
+        return kICADeviceNotOpenErr;
+    }
+    LOG("ScanRaw: connected via %{public}s", s->isUSB ? "USB" : "TCP");
 
     // clear any stale engine session, like the original driver does on open
     twain_state(c, TWAIN_CMD_ABORT, NULL);
@@ -1239,12 +1262,12 @@ static ICAError ScanRaw(const ScanSettings* s,
     unsigned char inq[70];
     memset(inq, 0, sizeof inq);
     if (twain_command(c, TWAIN_CMD_INQUIRY, inq, sizeof inq) != 0 || inq[0] != TWAIN_RES_CODE) {
-        
+        LOG("ScanRaw: INQUIRY failed (hdr 0x%02x)", inq[0]);
         conn_close(c);
         return kICADeviceNotFoundErr;
     }
     if (inq[3] != TWAIN_MSG_PRODUCT_INFO) {
-        
+        LOG("ScanRaw: unexpected INQUIRY msg 0x%02x", inq[3]);
         conn_close(c);
         return kICADeviceNotFoundErr;
     }
@@ -1287,7 +1310,7 @@ static ICAError ScanRaw(const ScanSettings* s,
 
     // RESERVE
     if (twain_until_ready(c, TWAIN_CMD_RESERVE_UNIT) != 1) {
-        
+        LOG("ScanRaw: RESERVE_UNIT failed");
         twain_state(c, TWAIN_CMD_ABORT, NULL);
         conn_close(c);
         return kICADeviceInternalErr;
@@ -1334,6 +1357,7 @@ static ICAError ScanRaw(const ScanSettings* s,
         usleep(500 * 1000);
     }
     if (sw_err) {
+        LOG("ScanRaw: SET_WINDOW failed (status 0x%02x)", rsw[1]);
         twain_state(c, TWAIN_CMD_RELEASE_UNIT, NULL);
         conn_close(c);
         return kICADeviceInternalErr;
@@ -1548,11 +1572,12 @@ block_done: ;
     conn_close(c);
 
     if (failed || !done) {
-        
+        LOG("ScanRaw: transfer failed (failed=%d done=%d rows=%u/%u)", failed, done, yOff, paraH);
         free(pixels);
         return kICADeviceInternalErr;
     }
 
+    LOG("ScanRaw: done %ux%u bpp=%u", paraW, paraH, bpp);
     if (progressFn) progressFn(100, ctx);
 
     if (out) *out = pixels;
@@ -1689,7 +1714,7 @@ static ICAError RunScanSynchronous(const ScannerObjectInfo* deviceObjectInfo,
 
     err = ScanRaw(&s, &pixels, &w, &h, (unsigned*)&bpp, ProgressNoData, &s.object);
     if (err != noErr) {
-        
+        LOG("scan failed: %d", (int)err);
         SendSimpleNotification(s.object, kICANotificationTypeScannerScanDone);
         pthread_mutex_unlock(&gScanLock);
         return err;
@@ -1742,6 +1767,8 @@ static ICAError RunScanSynchronous(const ScannerObjectInfo* deviceObjectInfo,
                                           s.docFolder, s.docName, s.docExt,
                                           tmpPath, sizeof(tmpPath));
         if (werr != noErr) {
+            LOG("WriteDocumentFile failed %d folder=%{public}s name=%{public}s.%{public}s",
+                (int)werr, s.docFolder, s.docName, s.docExt);
             free(pixels);
             SendSimpleNotification(s.object, kICANotificationTypeScannerScanDone);
             pthread_mutex_unlock(&gScanLock);
@@ -1793,7 +1820,8 @@ static ICAError RunScanSynchronous(const ScannerObjectInfo* deviceObjectInfo,
             parentCopy.reserved = gDeviceReservedFallback;
             parent = &parentCopy;
         }
-        ICDScannerNewObjectInfoCreated(parent, 0, &newObj);
+        ICAError oerr = ICDScannerNewObjectInfoCreated(parent, 0, &newObj);
+        LOG("NewObjectInfoCreated err=%d obj=%u file=%{public}s", (int)oerr, (unsigned)newObj, finalPath);
         if (newObj != kICANoObject) {
             // record the live ICAObject so GetObjectInfo -> newObj and
             // ReadFileData can serve the saved JPEG for this document
@@ -1815,6 +1843,7 @@ static ICAError RunScanSynchronous(const ScannerObjectInfo* deviceObjectInfo,
 
 static ICAError Start(const ScannerObjectInfo* deviceObjectInfo, ICD_ScannerStartPB* pb)
 {
+    LOG("Start object=%u", (unsigned)pb->object);
 
     gSettings.object = pb->object;
 
@@ -1900,6 +1929,7 @@ static ICD_scanner_callback_functions gCallbacks = {
 
 int main(int argc, const char* argv[])
 {
+    LOG("driver starting (pid %d, argc %d)", getpid(), argc);
     gICDScannerCallbackFunctions = gCallbacks;
     return ICD_ScannerMain(argc, argv);
 }

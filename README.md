@@ -103,3 +103,14 @@ BSD 2-Clause. See [LICENSE](LICENSE).
 The reverse engineer lives on a farm. The SANE project's `xerox_mfp`
 backends and the open-source `wia`/scanner hacking community made this
 possible. Not affiliated with Samsung or HP.
+## Troubleshooting
+
+The driver logs every step to the unified log. While reproducing a problem run:
+
+```sh
+log stream --info --predicate 'subsystem == "pl.m2070.scanner" OR process == "icdd"'
+```
+
+Note: `Samsung Scanner.app` is not a GUI application — it is launched in the
+background by the Image Capture daemon. Double-clicking it just starts and
+quits it. Use Preview → File → Import from Scanner, or Image Capture.
