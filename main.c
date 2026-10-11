@@ -1,20 +1,22 @@
 // Native arm64 Image Capture device module (ICDM) for Samsung M2070 series
 // network scanners (SANE xerox_mfp backend at _scanner._tcp / port 9400).
 //
-// Iteration 1: contract skeleton. Mirrors the parameter construction logic
-// of the original (x86_64 Rosetta-only) "Samsung Scanner.app" driver, decoded
-// in a prior session, but logs every dict it sees and returns so the real
-// runtime contract can be captured and copied exactly.
+// Mirrors the parameter construction logic of the original (x86_64
+// Rosetta-only) "Samsung Scanner.app" driver.  The same xerox_mfp command set
+// is spoken over two transports: TCP/9400 (Wi-Fi / Ethernet, found via
+// Bonjour) and the vendor-specific bulk interface of the USB device.
 //
 // Build/install target: /Library/Image Capture/Devices/Samsung Scanner.app
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <pthread.h>
 #include <time.h>
 #include <unistd.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/time.h>
@@ -28,6 +30,8 @@
 #include <CoreFoundation/CoreFoundation.h>
 #include <CoreServices/CoreServices.h>
 #include <IOKit/IOKitLib.h>
+#include <IOKit/IOCFPlugIn.h>
+#include <IOKit/usb/IOUSBLib.h>
 
 #include <ImageIO/ImageIO.h>
 #include <CoreGraphics/CoreGraphics.h>
@@ -234,6 +238,9 @@ typedef struct DeviceState {
     char name[64];
     char ip[64];
     char sanedev[96];
+    int isUSB;                 // 1: talk over USB bulk pipes, 0: TCP
+    UInt32 usbLocationID;
+    char usbIORegPath[512];    // io_string_t
 } DeviceState;
 
 typedef struct ScanSettings {
@@ -245,6 +252,9 @@ typedef struct ScanSettings {
     int isOverview;            // "scan mode" == overview
     unsigned gen;              // request generation (single-flight)
     char sanedev[96];
+    int isUSB;
+    UInt32 usbLocationID;
+    char usbIORegPath[512];
     ICAObject object;
     char docFolder[512];       // NoData scans: client's security-scoped output folder
     char docName[128];
@@ -280,13 +290,11 @@ static void StateFromUserInfo(DeviceState* st, CFDictionaryRef params)
         name = (CFStringRef)user;
     } else {
         CFTypeRef txt = CFDictionaryGetValue(params, kTXTKey);
-        if (txt) {
+        if (txt && CFGetTypeID(txt) == CFDictionaryGetTypeID()) {
             CFTypeRef mdl = CFDictionaryGetValue((CFDictionaryRef)txt, kMDLKey);
-            if (mdl) name = (CFStringRef)mdl;
-            else {
-                CFTypeRef mfg = CFDictionaryGetValue((CFDictionaryRef)txt, kMFGKey);
-                if (mfg) name = (CFStringRef)mfg;
-            }
+            CFTypeRef mfg = CFDictionaryGetValue((CFDictionaryRef)txt, kMFGKey);
+            if (mdl && CFGetTypeID(mdl) == CFStringGetTypeID()) name = (CFStringRef)mdl;
+            else if (mfg && CFGetTypeID(mfg) == CFStringGetTypeID()) name = (CFStringRef)mfg;
         }
     }
     if (name) {
@@ -295,15 +303,16 @@ static void StateFromUserInfo(DeviceState* st, CFDictionaryRef params)
     if (!st->name[0]) strncpy(st->name, "Samsung M2070 Series", sizeof st->name - 1);
 
     // build the SANE device string from the open params
-    CFStringRef ip = CFDictionaryGetValue(params, CFSTR("ipAddress"));
-    if (ip) {
-        CFStringGetCString(ip, st->ip, sizeof st->ip, kCFStringEncodingUTF8);
-    } else {
+    CFTypeRef ip = CFDictionaryGetValue(params, CFSTR("ipAddress"));
+    if (!ip || CFGetTypeID(ip) != CFStringGetTypeID() ||
+        !CFStringGetCString((CFStringRef)ip, st->ip, sizeof st->ip, kCFStringEncodingUTF8)) {
         strncpy(st->ip, "127.0.0.1", sizeof st->ip - 1);
     }
     CFTypeRef port = CFDictionaryGetValue(params, CFSTR("ipPort"));
     long p = 9400;
-    CFNumberGetValue((CFNumberRef)port, kCFNumberLongType, &p);
+    if (port && CFGetTypeID(port) == CFNumberGetTypeID())
+        CFNumberGetValue((CFNumberRef)port, kCFNumberLongType, &p);
+    if (p <= 0 || p > 65535) p = 9400;
     snprintf(st->sanedev, sizeof st->sanedev, "xerox_mfp:tcp %s %ld", st->ip, p);
 }
 
@@ -311,13 +320,10 @@ static void StateFromUserInfo(DeviceState* st, CFDictionaryRef params)
 // callbacks
 // ---------------------------------------------------------------------------
 
-static ICAError OpenTCPIPDevice(CFDictionaryRef params, ScannerObjectInfo* objectInfo)
+// Shared by the TCP and USB open paths: reset the object info while keeping
+// icdd's `reserved` back-pointer, and attach a fresh DeviceState.
+static DeviceState* InitDeviceObject(ScannerObjectInfo* objectInfo)
 {
-
-    
-
-    if (!objectInfo) return kICADeviceInvalidParamErr;
-
     // icdd pre-fills `reserved` with its internal pointer back to the
     // ICDDevice object.  ICDScannerNewObjectInfoCreated resolves the parent via
     // this field (ldur x0,[x0,#4]); zeroing it makes icdd reply
@@ -330,29 +336,76 @@ static ICAError OpenTCPIPDevice(CFDictionaryRef params, ScannerObjectInfo* objec
     objectInfo->icaObjectInfo.objectType = kICADevice;
     objectInfo->icaObjectInfo.objectSubtype = kICADeviceScanner;
 
-    DeviceState* st = malloc(sizeof(DeviceState));
-    if (!st) return kICADeviceMemoryAllocationErr;
-    StateFromUserInfo(st, params);
-    strncpy((char*)objectInfo->name, st->name, 31);
-    objectInfo->name[31] = 0;
+    DeviceState* st = calloc(1, sizeof(DeviceState));
+    if (!st) return NULL;
     objectInfo->flags = 0;
     objectInfo->privateData = (Ptr)st;
+    return st;
+}
 
+static void SetDeviceObjectName(ScannerObjectInfo* objectInfo, const DeviceState* st)
+{
+    strncpy((char*)objectInfo->name, st->name, 31);
+    objectInfo->name[31] = 0;
+}
+
+static ICAError OpenTCPIPDevice(CFDictionaryRef params, ScannerObjectInfo* objectInfo)
+{
+    if (!objectInfo || !params) return kICADeviceInvalidParamErr;
+
+    DeviceState* st = InitDeviceObject(objectInfo);
+    if (!st) return kICADeviceMemoryAllocationErr;
+    StateFromUserInfo(st, params);
+    SetDeviceObjectName(objectInfo, st);
+    return noErr;
+}
+
+// Model name for a USB-attached device, from its idProduct.
+static const char* USBModelName(io_service_t service)
+{
+    const char* name = "Samsung M2070 Series";
+    if (!service) return name;
+    CFTypeRef pid = IORegistryEntryCreateCFProperty(service, CFSTR("idProduct"),
+                                                    kCFAllocatorDefault, 0);
+    if (pid) {
+        long v = 0;
+        if (CFGetTypeID(pid) == CFNumberGetTypeID() &&
+            CFNumberGetValue((CFNumberRef)pid, kCFNumberLongType, &v) && v == 0x3488)
+            name = "Samsung M2060 Series";
+        CFRelease(pid);
+    }
+    return name;
+}
+
+static ICAError OpenUSBCommon(UInt32 locationID, const char* ioregPath,
+                              ScannerObjectInfo* objectInfo)
+{
+    if (!objectInfo) return kICADeviceInvalidParamErr;
+
+    DeviceState* st = InitDeviceObject(objectInfo);
+    if (!st) return kICADeviceMemoryAllocationErr;
+    st->isUSB = 1;
+    st->usbLocationID = locationID;
+    if (ioregPath) snprintf(st->usbIORegPath, sizeof st->usbIORegPath, "%s", ioregPath);
+
+    io_service_t service = ioregPath && ioregPath[0]
+        ? IORegistryEntryFromPath(kIOMainPortDefault, ioregPath) : IO_OBJECT_NULL;
+    snprintf(st->name, sizeof st->name, "%s", USBModelName(service));
+    if (service) IOObjectRelease(service);
+    snprintf(st->sanedev, sizeof st->sanedev, "xerox_mfp:libusb 0x%08x", (unsigned)locationID);
+    SetDeviceObjectName(objectInfo, st);
     return noErr;
 }
 
 static ICAError OpenUSBDevice(UInt32 locationID, ScannerObjectInfo* objectInfo)
 {
-    (void)locationID; (void)objectInfo;
-    
-    return kICADeviceUnsupportedErr;
+    return OpenUSBCommon(locationID, NULL, objectInfo);
 }
 
 static ICAError OpenUSBDeviceWithIORegPath(UInt32 locationID, io_string_t ioregPath,
                                            ScannerObjectInfo* objectInfo)
 {
-    (void)locationID; (void)ioregPath; (void)objectInfo;
-    return kICADeviceUnsupportedErr;
+    return OpenUSBCommon(locationID, ioregPath, objectInfo);
 }
 
 static ICAError OpenFireWireDevice(UInt64 guid, ScannerObjectInfo* objectInfo)
@@ -462,7 +515,7 @@ static ICAError ReadFileData(const ScannerObjectInfo* objectInfo, UInt32 dataTyp
         return noErr;
     }
     UInt32 want = *length;
-    if (offset + want > (UInt32)total) want = (UInt32)total - offset;
+    if ((long)want > total - (long)offset) want = (UInt32)(total - (long)offset);
     fseek(f, offset, SEEK_SET);
     size_t got = fread(buffer, 1, want, f);
     fclose(f);
@@ -818,15 +871,37 @@ static unsigned char* ResamplePixels(const unsigned char* src, UInt32 sw, UInt32
 
 #define TWAIN_PNT_PER_MM         (1200.0 / 25.4)
 
-static int twain_send_all(int fd, const unsigned char* buf, size_t len, int timeoutSec)
+// ---------------------------------------------------------------------------
+// transport: the same command packets go over TCP/9400 or USB bulk pipes
+// ---------------------------------------------------------------------------
+
+typedef struct ScanConn {
+    int fd;                                   // TCP socket, -1 when USB
+    IOUSBInterfaceInterface300** intf;        // USB scanner interface, opened
+    UInt8 pipeIn, pipeOut;
+} ScanConn;
+
+static int conn_send(ScanConn* c, const unsigned char* buf, size_t len, int timeoutSec)
 {
+    if (timeoutSec <= 0) timeoutSec = 5;
+    if (c->intf) {
+        IOReturn kr = (*c->intf)->WritePipeTO(c->intf, c->pipeOut, (void*)buf, (UInt32)len,
+                                              (UInt32)timeoutSec * 1000, (UInt32)timeoutSec * 1000);
+        if (kr == kIOUSBPipeStalled) {
+            (*c->intf)->ClearPipeStallBothEnds(c->intf, c->pipeOut);
+            kr = (*c->intf)->WritePipeTO(c->intf, c->pipeOut, (void*)buf, (UInt32)len,
+                                         (UInt32)timeoutSec * 1000, (UInt32)timeoutSec * 1000);
+        }
+        return kr == kIOReturnSuccess ? 0 : -1;
+    }
+
     size_t off = 0;
     struct timeval tv;
-    tv.tv_sec = timeoutSec > 0 ? timeoutSec : 5;
+    tv.tv_sec = timeoutSec;
     tv.tv_usec = 0;
-    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+    setsockopt(c->fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
     while (off < len) {
-        ssize_t n = send(fd, buf + off, len - off, 0);
+        ssize_t n = send(c->fd, buf + off, len - off, 0);
         if (n < 0) {
             if (errno == EINTR) continue;
             return -1;
@@ -836,80 +911,302 @@ static int twain_send_all(int fd, const unsigned char* buf, size_t len, int time
     return 0;
 }
 
-// opcodes 25/32/70 with proper override quirks, mirroring xerox_mfp.c
-static int twain_recv_exact(int fd, unsigned char* buf, size_t len, int timeoutSec)
+// read exactly `len` bytes (USB: possibly over several bulk transfers)
+static int conn_recv_exact(ScanConn* c, unsigned char* buf, size_t len, int timeoutSec)
 {
-    struct timeval tv;
-    tv.tv_sec = timeoutSec > 0 ? timeoutSec : 8;
-    tv.tv_usec = 0;
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    if (timeoutSec <= 0) timeoutSec = 8;
     size_t got = 0;
+    if (c->intf) {
+        while (got < len) {
+            UInt32 n = (UInt32)((len - got) > (1u << 20) ? (1u << 20) : (len - got));
+            IOReturn kr = (*c->intf)->ReadPipeTO(c->intf, c->pipeIn, buf + got, &n,
+                                                 (UInt32)timeoutSec * 1000,
+                                                 (UInt32)timeoutSec * 1000);
+            if (kr == kIOUSBPipeStalled) {
+                (*c->intf)->ClearPipeStallBothEnds(c->intf, c->pipeIn);
+                return -1;
+            }
+            if (kr != kIOReturnSuccess) return -1;
+            if (n == 0) continue;   // zero-length packet
+            got += n;
+        }
+        return 0;
+    }
+
+    struct timeval tv;
+    tv.tv_sec = timeoutSec;
+    tv.tv_usec = 0;
+    setsockopt(c->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
     while (got < len) {
-        ssize_t n = recv(fd, buf + got, len - got, 0);
+        ssize_t n = recv(c->fd, buf + got, len - got, 0);
+        if (n < 0 && errno == EINTR) continue;
         if (n <= 0) return -1;
         got += (size_t)n;
     }
     return 0;
 }
 
-static int twain_command(int fd, unsigned char cmd0, unsigned char* resp, size_t respLen)
+// USB only: discard stale bulk-in data left by an interrupted session so the
+// next command does not read a previous reply (sane usb_dev_flush)
+static void conn_flush(ScanConn* c)
 {
-    unsigned char pkt[64];
-    size_t sendLen;
-    if (cmd0 == TWAIN_CMD_SET_WINDOW) {
-        respLen = 32;
+    if (!c->intf) return;
+    unsigned char buf[512];
+    for (int i = 0; i < 64; i++) {
+        UInt32 n = sizeof buf;
+        if ((*c->intf)->ReadPipeTO(c->intf, c->pipeIn, buf, &n, 100, 100) != kIOReturnSuccess || n == 0)
+            break;
     }
-    if (cmd0 == TWAIN_CMD_READ_IMAGE) {
-        // raw data transfer has no response header; caller reads blocklen bytes
-        resp = NULL;
-        respLen = 0;
+}
+
+static void conn_close(ScanConn* c)
+{
+    if (c->intf) {
+        (*c->intf)->USBInterfaceClose(c->intf);
+        (*c->intf)->Release(c->intf);
+        c->intf = NULL;
     }
-    memset(pkt, 0, sizeof pkt);
-    pkt[0] = TWAIN_REQ_A;
-    pkt[1] = TWAIN_REQ_B;
-    pkt[2] = cmd0;
-    if (cmd0 == TWAIN_CMD_READ_IMAGE) {
-        // raw data transfer has no response header; caller reads blocklen bytes
-        resp = NULL;
-        respLen = 0;
+    if (c->fd >= 0) {
+        close(c->fd);
+        c->fd = -1;
     }
-    memset(pkt, 0, sizeof pkt);
-    pkt[0] = TWAIN_REQ_A;
-    pkt[1] = TWAIN_REQ_B;
-    pkt[2] = cmd0;
-    if (cmd0 == TWAIN_CMD_SET_WINDOW) {
-        pkt[3] = 0x13; // declared length
-        sendLen = 25;  // actual wire length the firmware expects
-    } else {
-        pkt[3] = 0x00;
-        sendLen = 4;
+}
+
+// connect with a timeout; a fresh socket per address/attempt (a socket whose
+// connect() failed cannot be reused on BSD)
+static int tcp_connect(const char* host, int port, int timeoutSec)
+{
+    char portStr[16];
+    snprintf(portStr, sizeof portStr, "%d", port);
+    struct addrinfo hints, *res = NULL;
+    memset(&hints, 0, sizeof hints);
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    if (getaddrinfo(host, portStr, &hints, &res) != 0 || !res) return -1;
+
+    int fd = -1;
+    for (struct addrinfo* ai = res; ai && fd < 0; ai = ai->ai_next) {
+        int s = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (s < 0) continue;
+        int one = 1;
+        setsockopt(s, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
+        setsockopt(s, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+        int fl = fcntl(s, F_GETFL, 0);
+        fcntl(s, F_SETFL, fl | O_NONBLOCK);
+        int rc = connect(s, ai->ai_addr, ai->ai_addrlen);
+        if (rc != 0 && errno == EINPROGRESS) {
+            fd_set wfds;
+            FD_ZERO(&wfds);
+            FD_SET(s, &wfds);
+            struct timeval tv = { timeoutSec, 0 };
+            rc = -1;
+            if (select(s + 1, NULL, &wfds, NULL, &tv) == 1) {
+                int soerr = 0;
+                socklen_t sl = sizeof soerr;
+                if (getsockopt(s, SOL_SOCKET, SO_ERROR, &soerr, &sl) == 0 && soerr == 0) rc = 0;
+            }
+        }
+        if (rc == 0) {
+            fcntl(s, F_SETFL, fl);
+            fd = s;
+        } else {
+            close(s);
+        }
+    }
+    freeaddrinfo(res);
+    return fd;
+}
+
+// locate the IOUSBHostDevice for the scanner: by registry path, else by
+// vendor + locationID
+static io_service_t FindUSBService(const ScanSettings* s)
+{
+    if (s->usbIORegPath[0]) {
+        io_service_t e = IORegistryEntryFromPath(kIOMainPortDefault, s->usbIORegPath);
+        if (e) return e;
+    }
+    static const char* classes[] = { "IOUSBHostDevice", "IOUSBDevice" };
+    for (int ci = 0; ci < 2; ci++) {
+        CFMutableDictionaryRef m = IOServiceMatching(classes[ci]);
+        if (!m) continue;
+        DictSetLong(m, CFSTR("idVendor"), 0x04e8);
+        io_iterator_t it = IO_OBJECT_NULL;
+        if (IOServiceGetMatchingServices(kIOMainPortDefault, m, &it) != KERN_SUCCESS) continue;
+        io_service_t svc, found = IO_OBJECT_NULL;
+        while (!found && (svc = IOIteratorNext(it))) {
+            CFTypeRef loc = IORegistryEntryCreateCFProperty(svc, CFSTR("locationID"),
+                                                            kCFAllocatorDefault, 0);
+            long v = -1;
+            if (loc) {
+                if (CFGetTypeID(loc) == CFNumberGetTypeID())
+                    CFNumberGetValue((CFNumberRef)loc, kCFNumberLongType, &v);
+                CFRelease(loc);
+            }
+            if ((UInt32)v == s->usbLocationID) found = svc;
+            else IOObjectRelease(svc);
+        }
+        IOObjectRelease(it);
+        if (found) return found;
+    }
+    return IO_OBJECT_NULL;
+}
+
+// open the scanner's bulk interface.  Samsung MFPs expose the scanner as a
+// vendor-specific (0xFF) interface next to the printer-class (7) interface
+// that CUPS uses; never send scan commands to the printer interface.
+static int usb_open(const ScanSettings* s, ScanConn* c)
+{
+    io_service_t service = FindUSBService(s);
+    if (!service) return -1;
+
+    IOCFPlugInInterface** plugin = NULL;
+    SInt32 score = 0;
+    IOUSBDeviceInterface** dev = NULL;
+    kern_return_t kr = IOCreatePlugInInterfaceForService(service, kIOUSBDeviceUserClientTypeID,
+                                                         kIOCFPlugInInterfaceID, &plugin, &score);
+    IOObjectRelease(service);
+    if (kr != KERN_SUCCESS || !plugin) return -1;
+    (*plugin)->QueryInterface(plugin, CFUUIDGetUUIDBytes(kIOUSBDeviceInterfaceID), (LPVOID*)&dev);
+    IODestroyPlugInInterface(plugin);
+    if (!dev) return -1;
+
+    IOUSBFindInterfaceRequest req;
+    req.bInterfaceClass = kIOUSBFindInterfaceDontCare;
+    req.bInterfaceSubClass = kIOUSBFindInterfaceDontCare;
+    req.bInterfaceProtocol = kIOUSBFindInterfaceDontCare;
+    req.bAlternateSetting = kIOUSBFindInterfaceDontCare;
+    io_iterator_t it = IO_OBJECT_NULL;
+    if ((*dev)->CreateInterfaceIterator(dev, &req, &it) != kIOReturnSuccess) {
+        (*dev)->Release(dev);
+        return -1;
     }
 
-    if (twain_send_all(fd, pkt, sendLen, 10) != 0) return -1;
-    
+    // two passes: vendor-specific interfaces first, then any non-printer one
+    int ok = 0;
+    for (int pass = 0; pass < 2 && !ok; pass++) {
+        IOIteratorReset(it);
+        io_service_t isvc;
+        while (!ok && (isvc = IOIteratorNext(it))) {
+            IOCFPlugInInterface** ip = NULL;
+            IOUSBInterfaceInterface300** intf = NULL;
+            kr = IOCreatePlugInInterfaceForService(isvc, kIOUSBInterfaceUserClientTypeID,
+                                                   kIOCFPlugInInterfaceID, &ip, &score);
+            IOObjectRelease(isvc);
+            if (kr != KERN_SUCCESS || !ip) continue;
+            (*ip)->QueryInterface(ip, CFUUIDGetUUIDBytes(kIOUSBInterfaceInterfaceID300),
+                                  (LPVOID*)&intf);
+            IODestroyPlugInInterface(ip);
+            if (!intf) continue;
+
+            UInt8 cls = 0;
+            (*intf)->GetInterfaceClass(intf, &cls);
+            int wanted = (pass == 0) ? (cls == kUSBVendorSpecificClass)
+                                     : (cls != kUSBPrintingInterfaceClass && cls != kUSBVendorSpecificClass);
+            if (!wanted || (*intf)->USBInterfaceOpen(intf) != kIOReturnSuccess) {
+                (*intf)->Release(intf);
+                continue;
+            }
+            UInt8 nep = 0, in = 0, out = 0;
+            (*intf)->GetNumEndpoints(intf, &nep);
+            for (UInt8 pipe = 1; pipe <= nep; pipe++) {
+                UInt8 dir, num, type, interval;
+                UInt16 mps;
+                if ((*intf)->GetPipeProperties(intf, pipe, &dir, &num, &type, &mps, &interval) != kIOReturnSuccess)
+                    continue;
+                if (type != kUSBBulk) continue;
+                if (dir == kUSBIn && !in) in = pipe;
+                if (dir == kUSBOut && !out) out = pipe;
+            }
+            if (in && out) {
+                c->intf = intf;
+                c->pipeIn = in;
+                c->pipeOut = out;
+                ok = 1;
+            } else {
+                (*intf)->USBInterfaceClose(intf);
+                (*intf)->Release(intf);
+            }
+        }
+    }
+    IOObjectRelease(it);
+    (*dev)->Release(dev);
+    if (!ok) return -1;
+    conn_flush(c);
+    return 0;
+}
+
+static int conn_open(const ScanSettings* s, ScanConn* c)
+{
+    c->fd = -1;
+    c->intf = NULL;
+    if (s->isUSB) return usb_open(s, c);
+
+    // parse "xerox_mfp:tcp <ip> <port>" from sanedev
+    char devstr[128];
+    snprintf(devstr, sizeof devstr, "%s", s->sanedev[0] ? s->sanedev : "xerox_mfp:tcp 127.0.0.1 9400");
+    char ip[64] = "127.0.0.1";
+    int port = 9400;
+    char* toks[8] = { NULL };
+    int ti = 0;
+    char* save = NULL;
+    for (char* t = strtok_r(devstr, " ", &save); t && ti < 8; t = strtok_r(NULL, " ", &save))
+        toks[ti++] = t;
+    if (ti >= 2) snprintf(ip, sizeof ip, "%s", toks[1]);
+    if (ti >= 3) {
+        port = (int)strtol(toks[2], NULL, 10);
+        if (port <= 0 || port > 65535) port = 9400;
+    }
+
+    // The M2070's network stack can be slow to wake after idle (Wi-Fi power
+    // save); the client fires an auto-overview immediately on session open.
+    // Retry a few times before giving up.
+    for (int attempt = 0; attempt < 6; attempt++) {
+        c->fd = tcp_connect(ip, port, 5);
+        if (c->fd >= 0) return 0;
+        sleep(1);
+    }
+    return -1;
+}
+
+static int twain_command(ScanConn* c, unsigned char cmd0, unsigned char* resp, size_t respLen)
+{
+    unsigned char pkt[4];
+    if (cmd0 == TWAIN_CMD_READ_IMAGE) {
+        // raw data transfer has no response header; caller reads blocklen bytes
+        resp = NULL;
+        respLen = 0;
+    }
+    pkt[0] = TWAIN_REQ_A;
+    pkt[1] = TWAIN_REQ_B;
+    pkt[2] = cmd0;
+    pkt[3] = 0x00;   // SET_WINDOW is sent separately (25-byte packet)
+
+    if (conn_send(c, pkt, sizeof pkt, 10) != 0) return -1;
     if (resp && respLen) {
-        if (twain_recv_exact(fd, resp, respLen, 12) != 0) return -1;
-        
+        if (conn_recv_exact(c, resp, respLen, 12) != 0) return -1;
     }
     return 0;
 }
 
 // send a one-byte-opcode command and read its short response; returns state
-static int twain_state(int fd, unsigned char cmd0, unsigned char* respOut)
+static int twain_state(ScanConn* c, unsigned char cmd0, unsigned char* respOut)
 {
     unsigned char res[32];
-    if (twain_command(fd, cmd0, res, 32) != 0) return -1;
+    if (twain_command(c, cmd0, res, 32) != 0) {
+        conn_flush(c);
+        return -1;
+    }
     if (respOut) memcpy(respOut, res, 32);
     if (res[0] != TWAIN_RES_CODE) return -1;
     return res[1];
 }
 
 // issue a command, retrying while the fw reports busy; 1 on ready/good
-static int twain_until_ready(int fd, unsigned char cmd0)
+static int twain_until_ready(ScanConn* c, unsigned char cmd0)
 {
     int slept = 0;
     for (;;) {
-        int st = twain_state(fd, cmd0, NULL);
+        int st = twain_state(c, cmd0, NULL);
         if (st < 0) return -1;
         if (st != TWAIN_STATUS_BUSY && st != TWAIN_STATUS_CHECK)
             return (st == TWAIN_STATUS_GOOD) ? 1 : -1;
@@ -931,71 +1228,24 @@ static ICAError ScanRaw(const ScanSettings* s,
     if (outBpp) *outBpp = 0;
     if (s->resolution < 1 || s->resolution > 1200) return kICADeviceInvalidParamErr;
 
-    // parse "xerox_mfp:tcp <ip> <port>" from sanedev
-    char devstr[128];
-    snprintf(devstr, sizeof devstr, "%s", s->sanedev[0] ? s->sanedev : "xerox_mfp:tcp 127.0.0.1 9400");
-    char ip[64] = "127.0.0.1";
-    int port = 9400;
-    {
-        char* toks[8] = { NULL };
-        int ti = 0;
-        char* save = NULL;
-        for (char* t = strtok_r(devstr, " ", &save); t && ti < 8; t = strtok_r(NULL, " ", &save))
-            toks[ti++] = t;
-        // toks: [xerox_mfp:tcp, ip, port]
-        if (ti >= 3) {
-            snprintf(ip, sizeof ip, "%s", toks[1]);
-            port = (int)strtol(toks[2], NULL, 10);
-            if (port <= 0) port = 9400;
-        } else if (ti >= 2) {
-            snprintf(ip, sizeof ip, "%s", toks[1]);
-        }
-    }
-
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) return kICADeviceInternalErr;
-    struct sockaddr_in sa;
-    memset(&sa, 0, sizeof sa);
-    sa.sin_family = AF_INET;
-    sa.sin_port = htons((unsigned short)port);
-    if (inet_pton(AF_INET, ip, &sa.sin_addr) != 1) {
-        struct hostent* he = gethostbyname(ip);
-        if (!he) { close(fd); return kICADeviceNotFoundErr; }
-        memcpy(&sa.sin_addr, he->h_addr, he->h_length);
-    }
-    if (connect(fd, (struct sockaddr*)&sa, sizeof sa) != 0) {
-        // The M2070's network stack can be slow to wake after idle; the
-        // client fires an auto-overview immediately on session open and
-        // aborts to the full scan on the first connect failure.  Retry a
-        // few times before giving up so the overview has time to connect.
-        
-        int retried = 0;
-        for (; retried < 5; retried++) {
-            struct timeval tv = { 1, 0 };
-            select(0, NULL, NULL, NULL, &tv);
-            if (connect(fd, (struct sockaddr*)&sa, sizeof sa) == 0) break;
-            
-        }
-        if (retried == 5) {
-            close(fd);
-            return kICADeviceNotOpenErr;
-        }
-    }
+    ScanConn conn;
+    ScanConn* c = &conn;
+    if (conn_open(s, c) != 0) return kICADeviceNotOpenErr;
 
     // clear any stale engine session, like the original driver does on open
-    twain_state(fd, TWAIN_CMD_ABORT, NULL);
+    twain_state(c, TWAIN_CMD_ABORT, NULL);
 
     // INQUIRY
     unsigned char inq[70];
     memset(inq, 0, sizeof inq);
-    if (twain_command(fd, TWAIN_CMD_INQUIRY, inq, sizeof inq) != 0 || inq[0] != TWAIN_RES_CODE) {
+    if (twain_command(c, TWAIN_CMD_INQUIRY, inq, sizeof inq) != 0 || inq[0] != TWAIN_RES_CODE) {
         
-        close(fd);
+        conn_close(c);
         return kICADeviceNotFoundErr;
     }
     if (inq[3] != TWAIN_MSG_PRODUCT_INFO) {
         
-        close(fd);
+        conn_close(c);
         return kICADeviceNotFoundErr;
     }
 
@@ -1019,7 +1269,7 @@ static ICAError ScanRaw(const ScanSettings* s,
 
     unsigned winWidthPts  = (unsigned)(wmm * TWAIN_PNT_PER_MM);
     unsigned winLenPts    = (unsigned)(hmm * TWAIN_PNT_PER_MM);
-    if (!winWidthPts || !winLenPts) { close(fd); return kICADeviceInvalidParamErr; }
+    if (!winWidthPts || !winLenPts) { conn_close(c); return kICADeviceInvalidParamErr; }
     if (maxWinWidth && winWidthPts > maxWinWidth) winWidthPts = maxWinWidth;
     if (maxWinLen && winLenPts > maxWinLen) winLenPts = maxWinLen;
 
@@ -1030,16 +1280,16 @@ static ICAError ScanRaw(const ScanSettings* s,
     if (s->pixelType == 2) pxToLen = 1200.0 / s->resolution;  // JPEG: engine prints 1:1 (probe: 2480px/210mm @300dpi)
     unsigned paraW = (unsigned)(winWidthPts / pxToLen);
     unsigned paraH = (unsigned)(winLenPts / pxToLen);
-    if (paraW == 0 || paraH == 0) { close(fd); return kICADeviceInvalidParamErr; }
+    if (paraW == 0 || paraH == 0) { conn_close(c); return kICADeviceInvalidParamErr; }
     unsigned bpp = (s->pixelType == 2) ? 3 : 1;
     unsigned modeByte = (s->pixelType == 2) ? TWAIN_MODE_RGB24 : TWAIN_MODE_GRAY8;
     unsigned compByte = (s->pixelType == 2) ? TWAIN_COMP_JPG : 0x00;
 
     // RESERVE
-    if (twain_until_ready(fd, TWAIN_CMD_RESERVE_UNIT) != 1) {
+    if (twain_until_ready(c, TWAIN_CMD_RESERVE_UNIT) != 1) {
         
-        twain_state(fd, TWAIN_CMD_ABORT, NULL);
-        close(fd);
+        twain_state(c, TWAIN_CMD_ABORT, NULL);
+        conn_close(c);
         return kICADeviceInternalErr;
     }
     int reserved = 1;
@@ -1066,7 +1316,7 @@ static ICAError ScanRaw(const ScanSettings* s,
     int sw_err = 1;
     for (int attempt = 0; attempt < 20 && sw_err; attempt++) {
         memset(rsw, 0, sizeof rsw);
-        if (twain_send_all(fd, sw, 25, 10) != 0 || twain_recv_exact(fd, rsw, 32, 12) != 0 || rsw[0] != TWAIN_RES_CODE) {
+        if (conn_send(c, sw, 25, 10) != 0 || conn_recv_exact(c, rsw, 32, 12) != 0 || rsw[0] != TWAIN_RES_CODE) {
             
             break;
         }
@@ -1084,8 +1334,8 @@ static ICAError ScanRaw(const ScanSettings* s,
         usleep(500 * 1000);
     }
     if (sw_err) {
-        twain_state(fd, TWAIN_CMD_RELEASE_UNIT, NULL);
-        close(fd);
+        twain_state(c, TWAIN_CMD_RELEASE_UNIT, NULL);
+        conn_close(c);
         return kICADeviceInternalErr;
     }
 
@@ -1095,7 +1345,7 @@ static ICAError ScanRaw(const ScanSettings* s,
     // one protocol behavior that differs from the proven probe path.
     unsigned char ors[32];
     memset(ors, 0, sizeof ors);
-    if (twain_command(fd, TWAIN_CMD_OBJECT_POS, ors, sizeof ors) != 0) {
+    if (twain_command(c, TWAIN_CMD_OBJECT_POS, ors, sizeof ors) != 0) {
         
     } else {
         
@@ -1105,8 +1355,8 @@ static ICAError ScanRaw(const ScanSettings* s,
 
     unsigned char* pixels = calloc((size_t)paraW * paraH * bpp, 1);
     if (!pixels) {
-        twain_state(fd, TWAIN_CMD_RELEASE_UNIT, NULL);
-        close(fd);
+        twain_state(c, TWAIN_CMD_RELEASE_UNIT, NULL);
+        conn_close(c);
         return kICADeviceInternalErr;
     }
 
@@ -1131,7 +1381,7 @@ static ICAError ScanRaw(const ScanSettings* s,
         int timeouts = 0;
         for (;;) {
             memset(rb, 0, sizeof rb);
-            if (twain_command(fd, TWAIN_CMD_READ, rb, sizeof rb) != 0 || rb[0] != TWAIN_RES_CODE) {
+            if (twain_command(c, TWAIN_CMD_READ, rb, sizeof rb) != 0 || rb[0] != TWAIN_RES_CODE) {
                 
                 failed = 1;
                 break;
@@ -1173,19 +1423,14 @@ static ICAError ScanRaw(const ScanSettings* s,
     if (blocklen <= 16) {
         if (lastBlock) { done = 1; break; }
         if (busyPolls > 1500) { failed = 1; break; }   // 5 min at 200ms
-        struct timeval tv; gettimeofday(&tv, 0);
-        if (busyPolls % 25 == 0)
-            
         usleep(200 * 1000);
         busyPolls++;
         continue;
     }
 
-    struct timeval btv; gettimeofday(&btv, 0);
-
     // request the block data: READ_IMAGE (0x29) triggers the fw to send the
     // announced blocklen raw bytes (the 0x28 reply was a header only)
-    if (twain_command(fd, TWAIN_CMD_READ_IMAGE, NULL, 0) != 0) {
+    if (twain_command(c, TWAIN_CMD_READ_IMAGE, NULL, 0) != 0) {
         
         failed = 1;
         break;
@@ -1193,15 +1438,7 @@ static ICAError ScanRaw(const ScanSettings* s,
 
     unsigned char* blk = malloc(blocklen);
     if (!blk) { failed = 1; break; }
-    size_t got = 0;
-    while (got < blocklen) {
-        struct timeval tv; tv.tv_sec = 12; tv.tv_usec = 0;
-        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
-        ssize_t n = recv(fd, blk + got, blocklen - got, 0);
-        if (n <= 0) { free(blk); failed = 1; break; }
-        got += (size_t)n;
-    }
-    if (failed) { free(blk); break; }
+    if (conn_recv_exact(c, blk, blocklen, 12) != 0) { free(blk); failed = 1; break; }
 
     if (bpp == 1) {
         // copy this block's rows into the output plane (trim to para)
@@ -1245,6 +1482,13 @@ static ICAError ScanRaw(const ScanSettings* s,
             break;
         }
         if (dw > paraW) dw = paraW;   // engine may over-send width; trim to para
+        // tail blocks past the window bottom are drained but not stored
+        // (paraH - yOff would underflow and overrun `pixels`)
+        if (yOff >= paraH) {
+            CGImageRelease(jimg);
+            free(blk);
+            goto block_done;
+        }
         if (dh > paraH - yOff) dh = paraH - yOff;
         // CGBitmapContextCreate refuses 24-bit contexts; draw into RGBA (like
         // ResamplePixels) and pack down to RGB24 per row.
@@ -1275,6 +1519,7 @@ static ICAError ScanRaw(const ScanSettings* s,
     }
 
     yOff += vertical;
+block_done: ;
 
         int pct = (int)((double)yOff / paraH * 100.0);
         if (pct > 100) pct = 100;
@@ -1297,10 +1542,10 @@ static ICAError ScanRaw(const ScanSettings* s,
 
     // teardown in the original's ModelFinishScanning order: ABORT then RELEASE.
     if (reserved) {
-        twain_state(fd, TWAIN_CMD_ABORT, NULL);
-        twain_state(fd, TWAIN_CMD_RELEASE_UNIT, NULL);
+        twain_state(c, TWAIN_CMD_ABORT, NULL);
+        twain_state(c, TWAIN_CMD_RELEASE_UNIT, NULL);
     }
-    close(fd);
+    conn_close(c);
 
     if (failed || !done) {
         
@@ -1331,26 +1576,48 @@ static int ProgressNoData(int pct, void* ctx)
     return 0;
 }
 
+// file name components come from the client; refuse anything that could
+// escape the destination folder
+static int SafePathComponent(const char* c)
+{
+    if (!c || !c[0] || strchr(c, '/') || strcmp(c, ".") == 0 || strcmp(c, "..") == 0) return 0;
+    return 1;
+}
+
+static CFStringRef ImageTypeForExtension(const char* ext)
+{
+    if (!strcasecmp(ext, "tif") || !strcasecmp(ext, "tiff")) return CFSTR("public.tiff");
+    if (!strcasecmp(ext, "png"))  return CFSTR("public.png");
+    if (!strcasecmp(ext, "heic")) return CFSTR("public.heic");
+    if (!strcasecmp(ext, "bmp"))  return CFSTR("com.microsoft.bmp");
+    if (!strcasecmp(ext, "pdf"))  return CFSTR("com.adobe.pdf");
+    return CFSTR("public.jpeg");
+}
+
 // NoData full scans complete by the DRIVER writing the finished image into the
 // client's security-scoped output folder (verified vs the working original
 // driver with fs_usage). Mirror its atomic pattern: hidden temp then rename.
+// The format follows the requested extension (Preview/Image Capture offer
+// JPEG, TIFF, PNG, HEIC, PDF ...); unknown extensions fall back to JPEG.
 static ICAError WriteDocumentFile(const unsigned char* pixels, unsigned w, unsigned h, int bpp,
-                                  const char* folder, const char* name, const char* ext,
+                                  long dpi, const char* folder, const char* name, const char* ext,
                                   char* outPath, size_t outPathSize)
 {
-    if (!pixels || w == 0 || h == 0 || !folder || !folder[0] || !name || !name[0] || !ext || !ext[0])
+    if (!pixels || w == 0 || h == 0 || !folder || !folder[0] ||
+        !SafePathComponent(name) || !SafePathComponent(ext))
         return kICADeviceInvalidParamErr;
+    if (dpi <= 0) dpi = 300;
 
     char tmpPath[768], finalPath[768];
-    snprintf(finalPath, sizeof finalPath, "%s/%s.%s", folder, name, ext);
-    snprintf(tmpPath, sizeof tmpPath, "%s/.%s.%s-%05x", folder, name, ext,
-             (unsigned)(getpid() ^ (unsigned)time(0)) & 0xfffffu);
-    tmpPath[767] = 0;
+    if (snprintf(finalPath, sizeof finalPath, "%s/%s.%s", folder, name, ext) >= (int)sizeof finalPath)
+        return kICADeviceInvalidParamErr;
+    if (snprintf(tmpPath, sizeof tmpPath, "%s/.%s.%s-%05x", folder, name, ext,
+                 (unsigned)(getpid() ^ (unsigned)time(0)) & 0xfffffu) >= (int)sizeof tmpPath)
+        return kICADeviceInvalidParamErr;
 
     CGColorSpaceRef cs = (bpp == 1) ? CGColorSpaceCreateDeviceGray() : CGColorSpaceCreateDeviceRGB();
     CGDataProviderRef prov = CGDataProviderCreateWithData(NULL, pixels, (size_t)w * h * bpp, NULL);
-    CGBitmapInfo bi = (bpp == 1) ? (CGBitmapInfo)kCGImageAlphaNone
-                                 : (CGBitmapInfo)(kCGImageAlphaNone | kCGImageByteOrderDefault);
+    CGBitmapInfo bi = (CGBitmapInfo)kCGImageAlphaNone;
     CGImageRef img = CGImageCreate(w, h, 8, (size_t)bpp * 8, (size_t)w * bpp, cs, bi, prov, NULL,
                                    false, kCGRenderingIntentDefault);
     CGDataProviderRelease(prov);
@@ -1359,19 +1626,44 @@ static ICAError WriteDocumentFile(const unsigned char* pixels, unsigned w, unsig
 
     CFURLRef url = CFURLCreateFromFileSystemRepresentation(NULL, (const UInt8*)tmpPath,
                                                            strlen(tmpPath), false);
-    CGImageDestinationRef dst = CGImageDestinationCreateWithURL(url, CFSTR("public.jpeg"), 1, NULL);
-    CFRelease(url);
-    if (!dst) { CGImageRelease(img); return kICADeviceMemoryAllocationErr; }
+    if (!url) { CGImageRelease(img); return kICADeviceMemoryAllocationErr; }
+    CFStringRef type = ImageTypeForExtension(ext);
+    bool ok = false;
 
-    CGImageDestinationAddImage(dst, img, NULL);
+    if (CFStringCompare(type, CFSTR("com.adobe.pdf"), 0) == kCFCompareEqualTo) {
+        // one page sized to the physical scan area
+        CGRect box = CGRectMake(0, 0, (CGFloat)w * 72.0 / dpi, (CGFloat)h * 72.0 / dpi);
+        CGContextRef pdf = CGPDFContextCreateWithURL(url, &box, NULL);
+        if (pdf) {
+            CGPDFContextBeginPage(pdf, NULL);
+            CGContextDrawImage(pdf, box, img);
+            CGPDFContextEndPage(pdf);
+            CGPDFContextClose(pdf);
+            CGContextRelease(pdf);
+            ok = true;
+        }
+    } else {
+        CGImageDestinationRef dst = CGImageDestinationCreateWithURL(url, type, 1, NULL);
+        if (!dst) dst = CGImageDestinationCreateWithURL(url, CFSTR("public.jpeg"), 1, NULL);
+        if (dst) {
+            double d = (double)dpi;
+            CFNumberRef dn = CFNumberCreate(NULL, kCFNumberDoubleType, &d);
+            CFMutableDictionaryRef props = CreateMutableDict();
+            CFDictionarySetValue(props, kCGImagePropertyDPIWidth, dn);
+            CFDictionarySetValue(props, kCGImagePropertyDPIHeight, dn);
+            CFRelease(dn);
+            CGImageDestinationAddImage(dst, img, props);
+            CFRelease(props);
+            ok = CGImageDestinationFinalize(dst);
+            CFRelease(dst);
+        }
+    }
+    CFRelease(url);
     CGImageRelease(img);
-    bool ok = CGImageDestinationFinalize(dst);
-    CFRelease(dst);
     if (!ok) { unlink(tmpPath); return kICADeviceInternalErr; }
 
     if (rename(tmpPath, finalPath) != 0) { unlink(tmpPath); return kICADeviceInternalErr; }
     if (outPath && outPathSize > 0) snprintf(outPath, outPathSize, "%s", finalPath);
-    
     return noErr;
 }
 
@@ -1413,11 +1705,12 @@ static ICAError RunScanSynchronous(const ScannerObjectInfo* deviceObjectInfo,
     UInt32 dw = (UInt32)s.width, dh = (UInt32)s.height;
     if (dw > 0 && dh > 0 && (dw != w || dh != h)) {
         unsigned char* rs = ResamplePixels(pixels, w, h, dw, dh, bpp);
-        free(pixels);
-        if (!rs) rs = NULL;
-        pixels = rs;
-        w = dw; h = dh;
-        
+        if (rs) {
+            free(pixels);
+            pixels = rs;
+            w = dw; h = dh;
+        }
+        // on failure keep the native-size image rather than crashing
     }
 
     UInt32 bpl = w * bpp;
@@ -1445,11 +1738,12 @@ static ICAError RunScanSynchronous(const ScannerObjectInfo* deviceObjectInfo,
         // without gLastScanValid set it replies kICADeviceNotFoundErr (-9901).
         char tmpPath[768];
         tmpPath[0] = 0;
-        ICAError werr = WriteDocumentFile(pixels, w, h, bpp,
+        ICAError werr = WriteDocumentFile(pixels, w, h, bpp, s.resolution,
                                           s.docFolder, s.docName, s.docExt,
                                           tmpPath, sizeof(tmpPath));
         if (werr != noErr) {
-            
+            free(pixels);
+            SendSimpleNotification(s.object, kICANotificationTypeScannerScanDone);
             pthread_mutex_unlock(&gScanLock);
             return werr;
         }
@@ -1535,8 +1829,12 @@ static ICAError Start(const ScannerObjectInfo* deviceObjectInfo, ICD_ScannerStar
     if (deviceObjectInfo && deviceObjectInfo->privateData) {
         DeviceState* st = (DeviceState*)deviceObjectInfo->privateData;
         snprintf(gSettings.sanedev, sizeof gSettings.sanedev, "%s", st->sanedev);
+        gSettings.isUSB = st->isUSB;
+        gSettings.usbLocationID = st->usbLocationID;
+        snprintf(gSettings.usbIORegPath, sizeof gSettings.usbIORegPath, "%s", st->usbIORegPath);
     } else {
         snprintf(gSettings.sanedev, sizeof gSettings.sanedev, "xerox_mfp:tcp 127.0.0.1 9400");
+        gSettings.isUSB = 0;
     }
 
     RunScanSynchronous(deviceObjectInfo, pb->object);

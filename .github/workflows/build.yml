@@ -1,0 +1,22 @@
+name: build
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  macos-arm64:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build driver bundle (arm64)
+        run: make
+      - name: Check architecture and signature
+        run: |
+          file "Samsung Scanner.app/Contents/MacOS/Samsung Scanner"
+          lipo -archs "Samsung Scanner.app/Contents/MacOS/Samsung Scanner" | grep -q arm64
+          codesign --verify --verbose "Samsung Scanner.app"
+      - name: Lint plists and scripts
+        run: |
+          plutil -lint "Samsung Scanner.app/Contents/Info.plist" "Samsung Scanner.app/Contents/Resources/"*.plist
+          bash -n tools/setup-printer.sh
