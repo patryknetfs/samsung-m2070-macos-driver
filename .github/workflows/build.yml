@@ -19,4 +19,4 @@ jobs:
       - name: Lint plists and scripts
         run: |
           plutil -lint "Samsung Scanner.app/Contents/Info.plist" "Samsung Scanner.app/Contents/Resources/"*.plist
-          bash -n tools/setup-printer.sh tools/diagnose.sh
+          for f in tools/*.sh; do bash -n "$f"; done
